@@ -14,6 +14,7 @@
 package io.streamnative.pulsar.handlers.kop.storage;
 
 import com.google.common.annotations.VisibleForTesting;
+import io.netty.util.concurrent.EventExecutor;
 import io.streamnative.pulsar.handlers.kop.DelayedFetch;
 import io.streamnative.pulsar.handlers.kop.DelayedProduceAndFetch;
 import io.streamnative.pulsar.handlers.kop.KafkaServiceConfiguration;
@@ -68,8 +69,10 @@ public class ReplicaManager {
         this.metadataNamespace = kafkaConfig.getKafkaMetadataNamespace();
     }
 
-    public PartitionLog getPartitionLog(TopicPartition topicPartition, String namespacePrefix) {
-        return logManager.getLog(topicPartition, namespacePrefix);
+    public PartitionLog getPartitionLog(TopicPartition topicPartition,
+                                        String namespacePrefix,
+                                        EventExecutor eventExecutor) {
+        return logManager.getLog(topicPartition, namespacePrefix, eventExecutor);
     }
 
     public void removePartitionLog(String topicName) {
@@ -154,7 +157,10 @@ public class ReplicaManager {
                         Errors.forException(new InvalidTopicException(
                                 String.format("Cannot append to internal topic %s", topicPartition.topic())))));
             } else {
-                PartitionLog partitionLog = getPartitionLog(topicPartition, namespacePrefix);
+                PartitionLog partitionLog = getPartitionLog(
+                        topicPartition,
+                        namespacePrefix,
+                        appendRecordsContext.getEventExecutor());
                 partitionLog.appendRecords(memoryRecords, origin, appendRecordsContext)
                         .thenAccept(offset -> addPartitionResponse.accept(topicPartition,
                                 new ProduceResponse.PartitionResponse(Errors.NONE, offset, -1L, -1L)))
@@ -252,7 +258,7 @@ public class ReplicaManager {
             }
         };
         readPartitionInfo.forEach((tp, fetchInfo) -> {
-            getPartitionLog(tp, context.getNamespacePrefix())
+            getPartitionLog(tp, context.getNamespacePrefix(), context.getEventExecutor())
                     .readRecords(fetchInfo, readCommitted,
                             limitBytes, maxReadEntriesNum, context)
                     .thenAccept(readResult -> {

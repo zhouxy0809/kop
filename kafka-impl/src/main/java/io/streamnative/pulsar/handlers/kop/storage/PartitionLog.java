@@ -18,6 +18,7 @@ import com.google.common.collect.Maps;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.util.Recycler;
+import io.netty.util.concurrent.EventExecutor;
 import io.streamnative.pulsar.handlers.kop.KafkaServiceConfiguration;
 import io.streamnative.pulsar.handlers.kop.KafkaTopicConsumerManager;
 import io.streamnative.pulsar.handlers.kop.KafkaTopicManager;
@@ -107,6 +108,8 @@ public class PartitionLog {
     private final EntryFormatter entryFormatter;
     private final ProducerStateManager producerStateManager;
 
+    private final EventExecutor eventExecutor;
+
     private final boolean preciseTopicPublishRateLimitingEnable;
 
     public PartitionLog(KafkaServiceConfiguration kafkaConfig,
@@ -115,7 +118,8 @@ public class PartitionLog {
                         TopicPartition topicPartition,
                         String fullPartitionName,
                         EntryFormatter entryFormatter,
-                        ProducerStateManager producerStateManager) {
+                        ProducerStateManager producerStateManager,
+                        EventExecutor eventExecutor) {
         this.kafkaConfig = kafkaConfig;
         this.requestStats = requestStats;
         this.time = time;
@@ -124,6 +128,7 @@ public class PartitionLog {
         this.entryFormatter = entryFormatter;
         this.producerStateManager = producerStateManager;
         this.preciseTopicPublishRateLimitingEnable = kafkaConfig.isPreciseTopicPublishRateLimiterEnable();
+        this.eventExecutor = eventExecutor;
     }
 
     @Data
@@ -327,6 +332,7 @@ public class PartitionLog {
             MemoryRecords validRecords = trimInvalidBytes(records, appendInfo);
 
             // Append Message into pulsar
+            final long startEnqueueNanos = MathUtils.nowInNano();
             final CompletableFuture<Optional<PersistentTopic>> topicFuture =
                     topicManager.getTopic(fullPartitionName);
             if (topicFuture.isCompletedExceptionally()) {
@@ -353,15 +359,21 @@ public class PartitionLog {
                 }
                 final EncodeRequest encodeRequest = EncodeRequest.get(validRecords, appendInfo);
 
-                requestStats.getPendingTopicLatencyStats().registerSuccessfulEvent(
-                        time.nanoseconds() - beforeRecordsProcess, TimeUnit.NANOSECONDS);
+                long pendingTopicLatencyNanos = time.nanoseconds() - beforeRecordsProcess;
+                eventExecutor.execute(() -> {
+                    requestStats.getPendingTopicLatencyStats().registerSuccessfulEvent(
+                            pendingTopicLatencyNanos, TimeUnit.NANOSECONDS);
+                });
 
                 long beforeEncodingStarts = time.nanoseconds();
                 final EncodeResult encodeResult = entryFormatter.encode(encodeRequest);
                 encodeRequest.recycle();
 
-                requestStats.getProduceEncodeStats().registerSuccessfulEvent(
-                        time.nanoseconds() - beforeEncodingStarts, TimeUnit.NANOSECONDS);
+                long encodeLatencyNanos = time.nanoseconds() - beforeEncodingStarts;
+                eventExecutor.execute(() -> {
+                    requestStats.getProduceEncodeStats().registerSuccessfulEvent(
+                            encodeLatencyNanos, TimeUnit.NANOSECONDS);
+                });
                 appendRecordsContext.getStartSendOperationForThrottling()
                         .accept(encodeResult.getEncodedByteBuf().readableBytes());
 
@@ -373,8 +385,15 @@ public class PartitionLog {
             };
 
             appendRecordsContext.getPendingTopicFuturesMap()
-                    .computeIfAbsent(topicPartition, ignored -> new PendingTopicFutures(requestStats))
-                    .addListener(topicFuture, persistentTopicConsumer, appendFuture::completeExceptionally);
+                    .computeIfAbsent(topicPartition, ignored -> new PendingTopicFutures())
+                    .addListener(topicFuture, persistentTopicConsumer, throwable -> {
+                        long messageQueuedLatencyNanos = MathUtils.elapsedNanos(startEnqueueNanos);
+                        PartitionLog.this.eventExecutor.execute(() -> {
+                            requestStats.getMessageQueuedLatencyStats().registerFailedEvent(
+                                    messageQueuedLatencyNanos, TimeUnit.NANOSECONDS);
+                        });
+                        appendFuture.completeExceptionally(throwable);
+                    });
         } catch (Exception exception) {
             log.error("Failed to handle produce request for {}", topicPartition, exception);
             appendFuture.completeExceptionally(exception);
@@ -456,8 +475,7 @@ public class PartitionLog {
                 final ManagedCursor cursor = cursorLongPair.getLeft();
                 final AtomicLong cursorOffset = new AtomicLong(cursorLongPair.getRight());
 
-                requestStats.getPrepareMetadataStats().registerSuccessfulEvent(
-                        MathUtils.elapsedNanos(startPrepareMetadataNanos), TimeUnit.NANOSECONDS);
+                registerPrepareMetadataFailedEvent(startPrepareMetadataNanos);
                 long adjustedMaxBytes = Math.min(partitionData.maxBytes, limitBytes.get());
                 readEntries(cursor, topicPartition, cursorOffset, maxReadEntriesNum, adjustedMaxBytes, topicManager)
                         .whenComplete((entries, throwable) -> {
@@ -516,8 +534,11 @@ public class PartitionLog {
     }
 
     private void registerPrepareMetadataFailedEvent(long startPrepareMetadataNanos) {
-        this.requestStats.getPrepareMetadataStats().registerFailedEvent(
-                MathUtils.elapsedNanos(startPrepareMetadataNanos), TimeUnit.NANOSECONDS);
+        long prepareMetadataNanos = MathUtils.elapsedNanos(startPrepareMetadataNanos);
+        eventExecutor.execute(() -> {
+            this.requestStats.getPrepareMetadataStats().registerFailedEvent(
+                    prepareMetadataNanos, TimeUnit.NANOSECONDS);
+        });
     }
 
     private void handleEntries(final CompletableFuture<ReadRecordsResult> future,
@@ -558,11 +579,15 @@ public class PartitionLog {
             // Get the last entry position for delayed fetch.
             Position lastPosition = this.getLastPositionFromEntries(committedEntries);
             final DecodeResult decodeResult = entryFormatter.decode(committedEntries, magic);
-            requestStats.getFetchDecodeStats().registerSuccessfulEvent(
-                    MathUtils.elapsedNanos(startDecodingEntriesNanos), TimeUnit.NANOSECONDS);
+            long fetchDecodeLatencyNanos = MathUtils.elapsedNanos(startDecodingEntriesNanos);
+            eventExecutor.execute(() -> {
+                requestStats.getFetchDecodeStats().registerSuccessfulEvent(
+                        fetchDecodeLatencyNanos, TimeUnit.NANOSECONDS);
+            });
 
             // collect consumer metrics
-            decodeResult.updateConsumerStats(topicPartition, committedEntries.size(), groupName, requestStats);
+            decodeResult.updateConsumerStats(topicPartition, committedEntries.size(),
+                    groupName, requestStats, eventExecutor);
             List<FetchResponse.AbortedTransaction> abortedTransactions = null;
             if (readCommitted) {
                 abortedTransactions = this.getAbortedIndexList(partitionData.fetchOffset);
@@ -673,15 +698,20 @@ public class PartitionLog {
                     } catch (MetadataCorruptedException e) {
                         log.error("[{}] Failed to peekOffsetFromEntry from position {}: {}",
                                 topicPartition, currentPosition, e.getMessage());
-                        messageReadStats.registerFailedEvent(
-                                MathUtils.elapsedNanos(startReadingMessagesNanos), TimeUnit.NANOSECONDS);
+                        long failedLatencyNanos = MathUtils.elapsedNanos(startReadingMessagesNanos);
+                        eventExecutor.execute(() -> {
+                            messageReadStats.registerFailedEvent(failedLatencyNanos, TimeUnit.NANOSECONDS);
+                        });
                         readFuture.completeExceptionally(e);
                         return;
                     }
                 }
 
-                messageReadStats.registerSuccessfulEvent(
-                        MathUtils.elapsedNanos(startReadingMessagesNanos), TimeUnit.NANOSECONDS);
+                long successLatencyNanos = MathUtils.elapsedNanos(startReadingMessagesNanos);
+                eventExecutor.execute(() -> {
+                    messageReadStats.registerSuccessfulEvent(
+                            successLatencyNanos, TimeUnit.NANOSECONDS);
+                });
                 readFuture.complete(entries);
             }
 
@@ -691,8 +721,10 @@ public class PartitionLog {
                 if (exception instanceof ManagedLedgerException.ManagedLedgerFencedException) {
                     topicManager.invalidateCacheForFencedManagerLedgerOnTopic(fullPartitionName);
                 }
-                messageReadStats.registerFailedEvent(
-                        MathUtils.elapsedNanos(startReadingMessagesNanos), TimeUnit.NANOSECONDS);
+                long failedLatencyNanos = MathUtils.elapsedNanos(startReadingMessagesNanos);
+                eventExecutor.execute(() -> {
+                    messageReadStats.registerFailedEvent(failedLatencyNanos, TimeUnit.NANOSECONDS);
+                });
                 readFuture.completeExceptionally(exception);
             }
         }, null, PositionImpl.latest);
@@ -745,7 +777,7 @@ public class PartitionLog {
                 .registerProducerInPersistentTopic(fullPartitionName, persistentTopic)
                 .ifPresent((producer) -> {
                     // collect metrics
-                    encodeResult.updateProducerStats(topicPartition, requestStats, producer);
+                    encodeResult.updateProducerStats(topicPartition, requestStats, producer, eventExecutor);
                 });
 
         final int numMessages = encodeResult.getNumMessages();
@@ -757,8 +789,11 @@ public class PartitionLog {
             appendRecordsContext.getCompleteSendOperationForThrottling().accept(byteBuf.readableBytes());
 
             if (e == null) {
-                requestStats.getMessagePublishStats().registerSuccessfulEvent(
-                        time.nanoseconds() - beforePublish, TimeUnit.NANOSECONDS);
+                long publishLatencyNanos = time.nanoseconds() - beforePublish;
+                eventExecutor.execute(() -> {
+                    requestStats.getMessagePublishStats().registerSuccessfulEvent(
+                            publishLatencyNanos, TimeUnit.NANOSECONDS);
+                });
                 final long lastOffset = offset + numMessages - 1;
 
                 AnalyzeResult analyzeResult = analyzeAndValidateProducerState(
@@ -781,8 +816,11 @@ public class PartitionLog {
                 appendFuture.complete(offset);
             } else {
                 log.error("publishMessages for topic partition: {} failed when write.", fullPartitionName, e);
-                requestStats.getMessagePublishStats().registerFailedEvent(
-                        time.nanoseconds() - beforePublish, TimeUnit.NANOSECONDS);
+                long publishLatencyNanos = time.nanoseconds() - beforePublish;
+                eventExecutor.execute(() -> {
+                    requestStats.getMessagePublishStats().registerFailedEvent(
+                            publishLatencyNanos, TimeUnit.NANOSECONDS);
+                });
                 appendFuture.completeExceptionally(e);
             }
             encodeResult.recycle();

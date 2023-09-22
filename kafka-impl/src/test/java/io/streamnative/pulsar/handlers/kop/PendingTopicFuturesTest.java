@@ -60,7 +60,7 @@ public class PendingTopicFuturesTest {
 
     @Test(timeOut = 10000)
     void testNormalComplete() throws ExecutionException, InterruptedException {
-        final PendingTopicFutures pendingTopicFutures = new PendingTopicFutures(null);
+        final PendingTopicFutures pendingTopicFutures = new PendingTopicFutures();
         final CompletableFuture<Optional<PersistentTopic>> topicFuture = new CompletableFuture<>();
         final List<Integer> completedIndexes = new ArrayList<>();
         final List<Integer> changesOfPendingCount = new ArrayList<>();
@@ -93,7 +93,7 @@ public class PendingTopicFuturesTest {
 
     @Test(timeOut = 10000)
     void testExceptionalComplete() throws ExecutionException, InterruptedException {
-        final PendingTopicFutures pendingTopicFutures = new PendingTopicFutures(null);
+        final PendingTopicFutures pendingTopicFutures = new PendingTopicFutures();
         final CompletableFuture<Optional<PersistentTopic>> topicFuture = new CompletableFuture<>();
         final List<String> exceptionMessages = new ArrayList<>();
         final List<Integer> changesOfPendingCount = new ArrayList<>();
@@ -127,7 +127,7 @@ public class PendingTopicFuturesTest {
 
     @Test(timeOut = 10000)
     void testParallelAccess() throws ExecutionException, InterruptedException {
-        final PendingTopicFutures pendingTopicFutures = new PendingTopicFutures(null);
+        final PendingTopicFutures pendingTopicFutures = new PendingTopicFutures();
         final CompletableFuture<Optional<PersistentTopic>> topicFuture = new CompletableFuture<>();
         final List<Integer> completedIndexes = new CopyOnWriteArrayList<>();
         int randomNum = ThreadLocalRandom.current().nextInt(0, 9);

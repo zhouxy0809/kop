@@ -13,6 +13,7 @@
  */
 package io.streamnative.pulsar.handlers.kop;
 
+import io.netty.util.concurrent.EventExecutor;
 import io.streamnative.pulsar.handlers.kop.storage.PartitionLog;
 import io.streamnative.pulsar.handlers.kop.storage.ReplicaManager;
 import io.streamnative.pulsar.handlers.kop.utils.delayed.DelayedOperation;
@@ -40,6 +41,8 @@ public class DelayedFetch extends DelayedOperation {
     protected volatile Boolean produceHappened;
     protected volatile int maxReadEntriesNum;
 
+    private volatile EventExecutor eventExecutor;
+
     protected static final AtomicReferenceFieldUpdater<DelayedFetch, Boolean> HAS_ERROR_UPDATER =
             AtomicReferenceFieldUpdater.newUpdater(DelayedFetch.class, Boolean.class, "hasError");
 
@@ -61,6 +64,7 @@ public class DelayedFetch extends DelayedOperation {
         super(delayMs, Optional.empty());
         this.readCommitted = readCommitted;
         this.context = context;
+        this.eventExecutor = context.getEventExecutor();
         this.callback = callback;
         this.readRecordsResult = readRecordsResult;
         this.readPartitionInfo = readPartitionInfo;
@@ -109,7 +113,8 @@ public class DelayedFetch extends DelayedOperation {
         for (Map.Entry<TopicPartition, PartitionLog.ReadRecordsResult> entry : readRecordsResult.entrySet()) {
             TopicPartition tp = entry.getKey();
             PartitionLog.ReadRecordsResult result = entry.getValue();
-            PartitionLog partitionLog = replicaManager.getPartitionLog(tp, context.getNamespacePrefix());
+            PartitionLog partitionLog = replicaManager
+                    .getPartitionLog(tp, context.getNamespacePrefix(), eventExecutor);
             PositionImpl currLastPosition = (PositionImpl) partitionLog.getLastPosition(context.getTopicManager());
             if (currLastPosition.compareTo(PositionImpl.earliest) == 0) {
                 HAS_ERROR_UPDATER.set(this, true);
