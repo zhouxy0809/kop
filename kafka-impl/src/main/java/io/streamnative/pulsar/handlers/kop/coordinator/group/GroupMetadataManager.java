@@ -389,7 +389,11 @@ public class GroupMetadataManager {
                 }
                 return Errors.NONE;
             }, scheduler)
-            .exceptionally(cause -> Errors.COORDINATOR_NOT_AVAILABLE);
+            .exceptionally(cause -> {
+                log.error("Failed to store groupAssignment {} to group {}, caused by: {}", groupAssignment,
+                        group.groupId(), cause);
+                return Errors.COORDINATOR_NOT_AVAILABLE;
+            });
     }
 
     // visible for mock
